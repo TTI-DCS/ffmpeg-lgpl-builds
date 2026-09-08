@@ -7,6 +7,15 @@
 # ⚠ --enable-gpl / --enable-version3 / --enable-nonfree は付けない。
 # ⚠ --disable-everything でコーデックを絞らない。
 #
+# 消費者は wonder_flow・loopeek・kinocore の3つで、全員がこの1ビルドにリンクする。
+# 外部ライブラリは snappy (BSD-3-Clause) と zlib (Zlib) の2つだけで、どちらも
+# avcodec へ静的リンクされる。したがって**この DLL の対応ソースに両者が含まれる** —
+# LGPL の corresponding source として、FFmpeg のソース tarball と一緒に snappy と
+# zlib の tarball も同じ Release へ添付すること (LICENSE-NOTES.md 参照)。
+#
+# ⚠ CLI (ffmpeg.exe / ffprobe.exe) も配る。loopeek の変換・解析はこれを外部プロセス
+#    として起動する構造なので、--disable-programs を戻すとその機能が丸ごと死ぬ。
+#
 # worktree から親リポの vendor へ入れる例:
 #   pwsh -NoProfile -File scripts/build-ffmpeg-8.1-lgpl.ps1 `
 #     -VendorDir C:\Users\sho1i\workspace\wonder_flow\vendor
@@ -32,6 +41,13 @@ param(
     [string]$VendorDir = (Join-Path $PSScriptRoot "..\vendor"),
     [string]$DirName = "ffmpeg-windows-8.1-lgpl21",
     [string]$FFmpegTag = "n8.1.2",
+    # 外部ライブラリ。どちらも avcodec へ静的リンクされ、対応ソースは同じ Release に
+    # 添付する (LGPL の corresponding source に含まれるため)。
+    #   snappy → HAP エンコーダ    (configure: hap_encoder_deps="libsnappy")
+    #   zlib   → PNG / EXR エンコーダ (png_encoder_select="deflate_wrapper" →
+    #            deflate_wrapper_deps="zlib" / exr_encoder_deps="zlib")
+    [string]$SnappyVersion = "1.2.2",
+    [string]$ZlibVersion = "1.3.1",
     [string]$SourceDir = "",
     [string]$MsysBash = "C:\msys64\usr\bin\bash.exe",
     [int]$Jobs = 0,
@@ -71,18 +87,56 @@ $ConfigureLog = Join-Path $LogDir "configure.log"
 $MakeLog = Join-Path $LogDir "make.log"
 $InstallLog = Join-Path $LogDir "install.log"
 
+# 外部ライブラリの prefix。ここも configuration 文字列として DLL に焼き付くので
+# ユーザ名を含めない中立パスにし、公開物では <deps> に scrub する。
+$DepsDir = if ($env:WONDER_FFMPEG_BUILD_DEPS) {
+    $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($env:WONDER_FFMPEG_BUILD_DEPS)
+} else {
+    "C:\ffmpeg-build\deps"
+}
+
 $TagUrl = "https://github.com/FFmpeg/FFmpeg/archive/refs/tags/$FFmpegTag.tar.gz"
 $TagBrowseUrl = "https://github.com/FFmpeg/FFmpeg/tree/$FFmpegTag"
+$SnappyTarUrl = "https://github.com/google/snappy/archive/refs/tags/$SnappyVersion.tar.gz"
+$ZlibTarUrl = "https://github.com/madler/zlib/archive/refs/tags/v$ZlibVersion.tar.gz"
 
 # 指示書どおりの configure フラグ (gpl / version3 / nonfree / disable-everything は付けない)
+#
+# ★ --disable-programs を外してある。ffmpeg / ffprobe の CLI は loopeek が変換と
+#   解析に使う。ffplay だけは SDL2 依存が増えるうえ誰も使わないので落とす。
+# ★ --extra-ldflags は -L ではなく -libpath: を渡すこと。configure:4440 が
+#   ldflags_filter を素通しの echo で初期化し、--extra-ldflags を処理する
+#   configure:4624 はまだその素通しを使う。MSVC 用フィルタが入るのは
+#   configure:5467 と後なので、-L → -libpath: の変換 (configure:5136) が
+#   間に合わず LNK4044 → LNK1181 になる。--extra-cflags の -I は MSVC が
+#   直接解釈するので影響を受けない。
+# ★ --pkg-config=false は必須である (2026-09-08 に実測で踏んだ)。
+#   PATH には nasm のために /c/msys64/mingw64/bin が載っており、そこには pkgconf と
+#   MSYS2 の .pc 一式がある。configure:7185 は zlib をまず pkg-config で探すので、
+#   放っておくと **MinGW の zlib** を掴む:
+#       CFLAGS  += -IC:/msys64/mingw64/bin/../include
+#       EXTRALIBS += -libpath:C:/msys64/mingw64/bin/../lib zlib.lib
+#   その include パスに入る MinGW の math.h は `__asm__` を使うので cl が C2065 で
+#   落ちる (libavdevice/avdevice.o)。pkg-config を止めると configure:7186 の
+#   check_lib へフォールバックし、-lz が zlib.lib に変換されて下の -libpath: で
+#   解決される。libsnappy は require = check_lib なので元から pkg-config を通らない。
+#
+#   これは「MSVC ビルドが見る外部ライブラリは、ここで明示的に渡した2つだけ」という
+#   ことを保証する意味も持つ。MSYS2 のライブラリを1つでも自動検出すると、MinGW の
+#   成果物が MSVC の DLL に混入する。
 $ConfigureArgs = @(
     "--toolchain=msvc",
     "--prefix=PREFIX_PLACEHOLDER",
+    "--pkg-config=false",
     "--enable-shared",
     "--disable-static",
-    "--disable-programs",
     "--disable-doc",
-    "--disable-debug"
+    "--disable-debug",
+    "--disable-ffplay",
+    "--enable-libsnappy",
+    "--enable-zlib",
+    "--extra-cflags=-IDEPS_PLACEHOLDER/include",
+    "--extra-ldflags=-libpath:DEPS_PLACEHOLDER/lib"
 )
 
 # PATH 上のツール位置だけ MSYS 形式 (/c/...) にする。bash の which 用。
@@ -140,6 +194,156 @@ function Ensure-Dir([string]$Path) {
     if (-not (Test-Path $Path)) {
         New-Item -ItemType Directory -Path $Path -Force | Out-Null
     }
+}
+
+function Resolve-CMake {
+    # VS 同梱を優先する。PATH 上の cmake がどれかは機械によって変わるため。
+    $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+    if (Test-Path $vswhere) {
+        $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath |
+            Select-Object -First 1
+        if ($vsPath) {
+            $bundled = Join-Path $vsPath "Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
+            if (Test-Path $bundled) { return $bundled }
+        }
+    }
+    $cmd = Get-Command cmake.exe -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    throw "cmake.exe not found (neither bundled with Visual Studio nor on PATH). Install the 'C++ CMake tools for Windows' component."
+}
+
+function Get-TarballSource {
+    param(
+        [Parameter(Mandatory = $true)][string]$Url,
+        [Parameter(Mandatory = $true)][string]$SrcPath,
+        [Parameter(Mandatory = $true)][string]$Label
+    )
+    if (Test-Path (Join-Path $SrcPath "CMakeLists.txt")) {
+        Write-Host "Using existing $Label source: $SrcPath"
+        return
+    }
+    Ensure-Dir $WorkRoot
+    $tar = Join-Path $WorkRoot ("{0}-{1}" -f $Label, [System.IO.Path]::GetFileName($Url))
+    if (-not (Test-Path $tar)) {
+        Write-Host "Downloading $Url ..."
+        Invoke-WebRequest -Uri $Url -OutFile $tar
+    }
+    Write-Host "Extracting $Label to $WorkRoot ..."
+    Push-Location $WorkRoot
+    try {
+        & tar.exe -xf $tar
+        if ($LASTEXITCODE -ne 0) { throw "tar extract failed for $Label with exit $LASTEXITCODE" }
+    }
+    finally {
+        Pop-Location
+    }
+    if (-not (Test-Path (Join-Path $SrcPath "CMakeLists.txt"))) {
+        throw "CMakeLists.txt not found after extracting ${Label}: $SrcPath"
+    }
+}
+
+# snappy と zlib を MSVC で静的ビルドし、$DepsDir に FFmpeg が期待する名前で置く。
+#
+# ★ ライブラリ名が要点である。configure:5134 の msvc_common_flags が -lsnappy を
+#   snappy.lib に、configure:5131 が -lz を zlib.lib に変換するので、その名前で
+#   見つかる必要がある。zlib の CMake は zlib.lib という名前で *zlib.dll の
+#   インポートライブラリ* も作るため、素直に install すると動的リンクになり
+#   zlib.dll の同梱が要る。静的な zlibstatic.lib をその名前で置き直す。
+#
+# ★ configure:7372 は require libsnappy ... -lsnappy -lstdc++ だが、
+#   configure:5133 が MSVC のとき -lstdc++ を捨てる。C++ ランタイムは snappy.lib の
+#   デフォルトライブラリ指令から MSVC が自動解決するので、明示的な指定は要らない。
+function Build-Dependencies {
+    $cmake = Resolve-CMake
+    Write-Host "cmake: $cmake"
+
+    $snappySrc = Join-Path $WorkRoot "snappy-$SnappyVersion"
+    $zlibSrc = Join-Path $WorkRoot "zlib-$ZlibVersion"
+    Get-TarballSource -Url $SnappyTarUrl -SrcPath $snappySrc -Label "snappy"
+    Get-TarballSource -Url $ZlibTarUrl -SrcPath $zlibSrc -Label "zlib"
+
+    if (Test-Path $DepsDir) { Remove-Item -Recurse -Force $DepsDir }
+    Ensure-Dir (Join-Path $DepsDir "lib")
+    Ensure-Dir (Join-Path $DepsDir "include")
+
+    # ---- snappy: そのまま install すれば snappy.lib になる ----
+    $snappyBuild = Join-Path $WorkRoot "snappy-build"
+    if (Test-Path $snappyBuild) { Remove-Item -Recurse -Force $snappyBuild }
+    Write-Host "==> Building snappy $SnappyVersion (MSVC, static)"
+    & $cmake -S $snappySrc -B $snappyBuild -G "Visual Studio 17 2022" -A x64 `
+        "-DCMAKE_INSTALL_PREFIX=$DepsDir" `
+        -DSNAPPY_BUILD_TESTS=OFF `
+        -DSNAPPY_BUILD_BENCHMARKS=OFF `
+        -DBUILD_SHARED_LIBS=OFF `
+        -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL
+    if ($LASTEXITCODE -ne 0) { throw "snappy cmake configure failed" }
+    & $cmake --build $snappyBuild --config Release --target install
+    if ($LASTEXITCODE -ne 0) { throw "snappy build/install failed" }
+
+    # ---- zlib: staging へ入れて、静的なほうを zlib.lib として採る ----
+    $zlibBuild = Join-Path $WorkRoot "zlib-build"
+    $zlibStage = Join-Path $WorkRoot "zlib-stage"
+    foreach ($d in @($zlibBuild, $zlibStage)) {
+        if (Test-Path $d) { Remove-Item -Recurse -Force $d }
+    }
+    Write-Host "==> Building zlib $ZlibVersion (MSVC)"
+    & $cmake -S $zlibSrc -B $zlibBuild -G "Visual Studio 17 2022" -A x64 `
+        "-DCMAKE_INSTALL_PREFIX=$zlibStage" `
+        -DZLIB_BUILD_EXAMPLES=OFF `
+        -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL
+    if ($LASTEXITCODE -ne 0) { throw "zlib cmake configure failed" }
+    & $cmake --build $zlibBuild --config Release --target install
+    if ($LASTEXITCODE -ne 0) { throw "zlib build/install failed" }
+
+    $zlibStatic = Join-Path $zlibStage "lib\zlibstatic.lib"
+    if (-not (Test-Path $zlibStatic)) {
+        throw "zlibstatic.lib not produced (looked in $zlibStatic). A dynamic zlib.lib would make FFmpeg depend on zlib.dll."
+    }
+    Copy-Item $zlibStatic (Join-Path $DepsDir "lib\zlib.lib") -Force
+    foreach ($h in @("zlib.h", "zconf.h")) {
+        Copy-Item (Join-Path $zlibStage "include\$h") (Join-Path $DepsDir "include\$h") -Force
+    }
+
+    # ★ zconf.h の HAVE_UNISTD_H ブロックを塞ぐ (2026-09-08 に実測で踏んだ)。
+    #
+    #   zconf.h:438 は `#ifdef HAVE_UNISTD_H` で Z_HAVE_UNISTD_H を立てる。FFmpeg の
+    #   config.h は `#define HAVE_UNISTD_H 0` と **値 0 で定義する**ので #ifdef は真に
+    #   なり、zconf.h が <unistd.h> を include して MSVC が C1083 で死ぬ
+    #   (libavformat/http.o)。
+    #
+    #   単なるコンパイルエラーではなく ABI の不一致でもある。zlib.lib 自身は CMake が
+    #   生成した zconf.h (`/* #undef Z_HAVE_UNISTD_H */`) で、かつ HAVE_UNISTD_H 未定義
+    #   でコンパイルされている = Z_HAVE_UNISTD_H は off。消費者側だけ on になると
+    #   z_off_t が off_t に変わり、ライブラリの実体と食い違う。off に固定するのは
+    #   **ヘッダを実際のビルドに合わせる**修正である。
+    #
+    #   この行を書き換えること自体は zlib 自身の ./configure がやるのと同じ機構で
+    #   (あちらは `#if 1` にする)、値の選択だけが逆である。patch した zconf.h は
+    #   ビルド入力にしか使わない — Install-VendorLayout が公開 zip に入れるのは
+    #   $PrefixDir/include (FFmpeg のヘッダ) だけで、deps の include は入らない。
+    #
+    #   すぐ下の HAVE_STDARG_H ブロックは塞がない。FFmpeg は HAVE_STDARG_H を定義せず、
+    #   かつ zconf.h:452 が `#if defined(STDC) || defined(Z_HAVE_STDARG_H)` なので
+    #   どちらでも結果が変わらない。
+    $zconf = Join-Path $DepsDir "include\zconf.h"
+    $needle = '#ifdef HAVE_UNISTD_H    /* may be set to #if 1 by ./configure */'
+    $zconfText = [System.IO.File]::ReadAllText($zconf)
+    if (-not $zconfText.Contains($needle)) {
+        throw "zconf.h does not contain the expected HAVE_UNISTD_H guard verbatim; zlib $ZlibVersion may have changed it. Re-check before assuming this patch is still needed."
+    }
+    $zconfText = $zconfText.Replace(
+        $needle,
+        '#if 0    /* forced off by build-ffmpeg-8.1-lgpl.ps1: MSVC has no unistd.h, and zlib.lib was compiled with Z_HAVE_UNISTD_H off */')
+    [System.IO.File]::WriteAllText($zconf, $zconfText, (New-Object System.Text.UTF8Encoding($false)))
+    Write-Host "  patched zconf.h: HAVE_UNISTD_H guard forced off"
+
+    foreach ($required in @("lib\snappy.lib", "lib\zlib.lib", "include\snappy-c.h", "include\zlib.h")) {
+        $p = Join-Path $DepsDir $required
+        if (-not (Test-Path $p)) { throw "Dependency prefix incomplete: $p" }
+    }
+    Write-Host "Dependencies ready at $DepsDir"
+    Get-ChildItem (Join-Path $DepsDir "lib") -Filter *.lib |
+        ForEach-Object { Write-Host ("    lib\{0}  ({1} bytes)" -f $_.Name, $_.Length) }
 }
 
 function Get-FFmpegSource {
@@ -240,21 +444,22 @@ function Build-FFmpeg {
     $srcWin = ConvertTo-WinFwdPath $SrcDir
     # --prefix は Windows 形式でよい (make install 先。cl のソース引数ではない)。
     $prefixWin = ConvertTo-WinFwdPath $PrefixDir
+    $depsWin = ConvertTo-WinFwdPath $DepsDir
 
+    # 実ビルド用と公開記録用を同じ配列から作る。以前は公開用の文字列を別に
+    # 書き下していたので、フラグを足すたびに両者がずれる余地があった。
     $cfg = @()
+    $pub = @()
     foreach ($a in $ConfigureArgs) {
-        if ($a -eq "--prefix=PREFIX_PLACEHOLDER") {
-            $cfg += "--prefix=$prefixWin"
-        } else {
-            $cfg += $a
-        }
+        $cfg += $a.Replace("PREFIX_PLACEHOLDER", $prefixWin).Replace("DEPS_PLACEHOLDER", $depsWin)
+        $pub += $a.Replace("PREFIX_PLACEHOLDER", "<prefix>").Replace("DEPS_PLACEHOLDER", "<deps>")
     }
     $cfgLine = ($cfg -join " ")
 
     # 実ビルドは実パスの --prefix。ORIGIN / NOTICE / 公開用 config.h には汎用形だけ書く
     # (ローカルユーザ名・worktree パスを公開成果物に焼き付けない #321)。
     $script:ConfigureLineBuild = "./configure $cfgLine"
-    $script:ConfigureLine = "./configure --toolchain=msvc --prefix=<prefix> --enable-shared --disable-static --disable-programs --disable-doc --disable-debug"
+    $script:ConfigureLine = "./configure " + ($pub -join " ")
     $script:PrefixWinForBuild = $prefixWin
 
     $nJobs = $Jobs
@@ -445,6 +650,19 @@ function Install-VendorLayout {
     foreach ($lib in $libs) {
         Copy-Item $lib.FullName (Join-Path $destLib $lib.Name) -Force
     }
+
+    # CLI。loopeek が変換・解析・プロキシ生成に使う。隣の DLL に動的リンクしている
+    # ので bin/ に DLL と同居させる。ffplay は --disable-ffplay で作られない。
+    foreach ($exe in @("ffmpeg.exe", "ffprobe.exe")) {
+        $src = Join-Path $prefixBin $exe
+        if (-not (Test-Path $src)) {
+            throw "Missing CLI in prefix/bin: $src (--disable-programs must not be set)"
+        }
+        Copy-Item $src (Join-Path $destBin $exe) -Force
+    }
+    if (Test-Path (Join-Path $prefixBin "ffplay.exe")) {
+        throw "ffplay.exe was built; --disable-ffplay is missing from the configure line"
+    }
     # .def は BtbN 版と同様 lib/ にあれば便利。あれば移す。
     if (Test-Path $prefixLib) {
         Get-ChildItem $prefixLib -Filter "*.def" -ErrorAction SilentlyContinue | ForEach-Object {
@@ -457,7 +675,11 @@ function Install-VendorLayout {
 
     if (-not $script:ConfigureLine) {
         # -PackageOnly / 再パッケージ時: 公開記録形を固定 (実パスを ORIGIN に書かない)
-        $script:ConfigureLine = "./configure --toolchain=msvc --prefix=<prefix> --enable-shared --disable-static --disable-programs --disable-doc --disable-debug"
+        $pubOnly = @()
+        foreach ($a in $ConfigureArgs) {
+            $pubOnly += $a.Replace("PREFIX_PLACEHOLDER", "<prefix>").Replace("DEPS_PLACEHOLDER", "<deps>")
+        }
+        $script:ConfigureLine = "./configure " + ($pubOnly -join " ")
     }
 
     # configure 結果の証拠 (programs 無しでも configuration / hwaccel を追える)。
@@ -495,6 +717,14 @@ function Install-VendorLayout {
         "ffmpeg_tarball_url=$TagUrl",
         "builds_release_url=https://github.com/TTI-DCS/ffmpeg-lgpl-builds/releases/tag/$FFmpegTag",
         "license=LGPLv2.1+",
+        # 外部ライブラリは avcodec へ静的リンクされるので、この DLL の対応ソースに
+        # 含まれる。どちらも同じ Release にソース tarball を添付すること。
+        "snappy_version=$SnappyVersion",
+        "snappy_tarball_url=$SnappyTarUrl",
+        "snappy_license=BSD-3-Clause",
+        "zlib_version=$ZlibVersion",
+        "zlib_tarball_url=$ZlibTarUrl",
+        "zlib_license=Zlib",
         "configure=$script:ConfigureLine"
     )
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
@@ -509,6 +739,11 @@ function Scrub-LocalPathsInText {
     $Text = [regex]::Replace($Text, "--prefix='[^']*'", "--prefix='<prefix>'")
     $Text = [regex]::Replace($Text, '--prefix="[^"]*"', '--prefix="<prefix>"')
     $Text = [regex]::Replace($Text, '--prefix=(?!<prefix>)(?:[A-Za-z]:)?[^\s"'']+', '--prefix=<prefix>')
+    # 外部ライブラリの prefix も configuration 文字列に載る。--prefix と同じ扱いで
+    # 汎用形にする (既定は中立パスなのでユーザ名は載らないが、-DepsDir を差し替えた
+    # ときに漏れないようにする)。
+    $depsFwd = ConvertTo-WinFwdPath $DepsDir
+    $Text = $Text.Replace($depsFwd, '<deps>')
     # FFMPEG_DATADIR / AVCONV_DATADIR
     $Text = [regex]::Replace($Text, '(#define\s+(?:FFMPEG_DATADIR|AVCONV_DATADIR)\s+")[^"]+(")', '${1}<prefix>/share/ffmpeg${2}')
     # 残余のユーザホーム / herdr worktree (保険)
@@ -559,7 +794,81 @@ function Test-VendorComplete {
         throw "ORIGIN.txt configure line must use generic --prefix=<prefix>"
     }
 
+    Test-CodecCoverage
     Write-Host "Vendor verification OK ($($dll.Name))"
+}
+
+# 消費者が実際に要求するものが揃っているかを、ビルドした CLI に訊いて確かめる。
+#
+# config.h の CONFIG_* を読むだけでは足りない。外部ライブラリのリンクが外れていても
+# ヘッダは残りうるし、逆に configure が黙って機能を落としていても気付けない。
+# ここで落ちるということは、その Release を出しても消費者側で機能が欠ける。
+#
+#   hap            loopeek の HAP / HapAlpha / HapQ 出力 (libsnappy)
+#   png / exr      loopeek の画像シーケンス書き出し (zlib)
+#   prores_ks      loopeek の ProRes 出力
+#   h264_mf        loopeek の H.264 出力 (OS ネイティブ)
+#   d3d11va        kinocore のゼロコピー再生経路
+function Test-CodecCoverage {
+    $ffmpeg = Join-Path $FFmpegDir "bin\ffmpeg.exe"
+    if (-not (Test-Path $ffmpeg)) { throw "Post-install missing bin\ffmpeg.exe" }
+    if (-not (Test-Path (Join-Path $FFmpegDir "bin\ffprobe.exe"))) {
+        throw "Post-install missing bin\ffprobe.exe"
+    }
+    if (Test-Path (Join-Path $FFmpegDir "bin\ffplay.exe")) {
+        throw "bin\ffplay.exe present; it must not be built"
+    }
+
+    $banner = & $ffmpeg -hide_banner -version 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "ffmpeg.exe failed to run:`n$banner" }
+    foreach ($bad in @('--enable-gpl', '--enable-version3', '--enable-nonfree')) {
+        if ($banner -match [regex]::Escape($bad)) { throw "version banner contains $bad" }
+    }
+    foreach ($want in @('--enable-libsnappy', '--enable-zlib')) {
+        if ($banner -notmatch [regex]::Escape($want)) { throw "version banner is missing $want" }
+    }
+
+    $encoders = & $ffmpeg -hide_banner -encoders 2>&1 | Out-String
+    foreach ($enc in @('hap', 'png', 'exr', 'prores_ks', 'h264_mf', 'pcm_s16le')) {
+        if ($encoders -notmatch "(?m)^\s*\S+\s+$([regex]::Escape($enc))\s") {
+            throw "encoder missing: $enc"
+        }
+    }
+
+    $decoders = & $ffmpeg -hide_banner -decoders 2>&1 | Out-String
+    foreach ($dec in @('hap', 'notchlc', 'prores', 'prores_raw', 'h264', 'aac')) {
+        if ($decoders -notmatch "(?m)^\s*\S+\s+$([regex]::Escape($dec))\s") {
+            throw "decoder missing: $dec"
+        }
+    }
+
+    $hwaccels = & $ffmpeg -hide_banner -hwaccels 2>&1 | Out-String
+    if ($hwaccels -notmatch '(?m)^\s*d3d11va\s*$') {
+        throw "d3d11va hwaccel missing (kinocore's zero-copy path needs it)"
+    }
+
+    # 静的リンクの確認。zlib.dll / snappy.dll に依存していたら、その DLL も配らねば
+    # ならず、消費者の同梱物が静かに壊れる。
+    $dumpbin = Get-Command dumpbin.exe -ErrorAction SilentlyContinue
+    if ($dumpbin) {
+        $avcodec = Get-ChildItem (Join-Path $FFmpegDir "bin") -Filter "avcodec-*.dll" | Select-Object -First 1
+        $deps = & $dumpbin.Source /dependents $avcodec.FullName 2>&1 | Out-String
+        foreach ($bad in @('zlib', 'snappy')) {
+            if ($deps -match "(?i)$bad[0-9]*\.dll") {
+                throw "$($avcodec.Name) depends on a $bad DLL; the dependency must be linked statically"
+            }
+        }
+    } else {
+        Write-Host "  (dumpbin not on PATH; skipped the static-linkage check)"
+    }
+
+    # MinGW の成果物が混入していないこと。--pkg-config=false で塞いでいるが、
+    # 一度実際に踏んでいるので結果側でも見る (banner は configuration 文字列を持つ)。
+    if ($banner -match '(?i)msys64|mingw') {
+        throw "version banner references MSYS2/MinGW paths; a MinGW library leaked into this MSVC build"
+    }
+
+    Write-Host "Codec coverage OK (hap/png/exr/prores_ks/h264_mf encoders, d3d11va)"
 }
 
 Write-Host "=== build-ffmpeg-8.1-lgpl.ps1 ==="
@@ -576,6 +885,7 @@ if ([System.IO.Path]::GetFullPath($FFmpegDir) -eq [System.IO.Path]::GetFullPath(
 
 if (-not $PackageOnly) {
     Import-VsDevEnvironment
+    Build-Dependencies
     Get-FFmpegSource
     Build-FFmpeg
 } else {

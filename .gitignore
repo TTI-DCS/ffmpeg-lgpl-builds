@@ -3,3 +3,4 @@ prefix/
 *.zip
 *.tar.gz
 FFmpeg-n*/
+vendor/
