@@ -4,3 +4,4 @@ prefix/
 *.tar.gz
 FFmpeg-n*/
 vendor/
+dist/
