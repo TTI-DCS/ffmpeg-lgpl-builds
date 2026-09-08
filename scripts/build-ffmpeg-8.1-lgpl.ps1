@@ -176,6 +176,7 @@ function Import-VsDevEnvironment {
     if (-not (Test-Path $launch)) {
         throw "Launch-VsDevShell.ps1 not found: $launch"
     }
+    $script:vsRoot = $vsPath
     Write-Host "Loading VsDevShell (amd64): $vsPath"
     & $launch -Arch amd64 -HostArch amd64 -SkipAutomaticLocation | Out-Null
 
@@ -253,6 +254,26 @@ function Get-TarballSource {
 # ★ configure:7372 は require libsnappy ... -lsnappy -lstdc++ だが、
 #   configure:5133 が MSVC のとき -lstdc++ を捨てる。C++ ランタイムは snappy.lib の
 #   デフォルトライブラリ指令から MSVC が自動解決するので、明示的な指定は要らない。
+#
+# ★ CRT は /MT (静的) で揃えること。`CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded`。
+#   FFmpeg の configure は CFLAGS に /MD も /MT も足さず、cl.exe の既定は /MT なので
+#   FFmpeg 側は静的 CRT (libucrt.lib) でコンパイルされる。ここを /MD にすると
+#   **同一 DLL 内で CRT が2つになる** (2026-09-08 に実測で踏んだ):
+#       LINK : warning LNK4098: defaultlib 'MSVCRT' conflicts with use of other libs
+#       LINK : warning LNK4217: symbol 'malloc' defined in 'libucrt.lib(malloc.obj)'
+#                               is imported by 'zlib.lib(zutil.obj)' in function 'zcalloc'
+#   zcalloc/zcfree は zlib 内で対になるので実害は出にくいが、ヒープが2つある状態は
+#   出荷してよいものではない。さらに /MD だと snappy (C++) が MSVCP140.dll を引き、
+#   VC++ 再頒布パッケージが無いマシンでアプリが起動しなくなる。/MT ならその依存も
+#   消えて DLL が自己完結する。
+#
+# ★ `CMAKE_POLICY_DEFAULT_CMP0091=NEW` を必ず添えること。`CMAKE_MSVC_RUNTIME_LIBRARY`
+#   はポリシー CMP0091 が NEW のときだけ効く。snappy 1.2.2 は
+#   `cmake_minimum_required(VERSION 3.10)` なので既定では OLD になり、**指定が黙って
+#   無視される** (2026-09-08 実測: zlib.lib は LIBCMT なのに snappy.lib だけ
+#   msvcprt / MSVCRT になった)。zlib 1.3.1 は `VERSION 2.4.4...3.15.0` の範囲指定で
+#   3.15 までのポリシーが NEW になるため、こちらは元から効いていた。
+#   `dumpbin /directives <lib>` の `/DEFAULTLIB:` で効いたかどうかを確認できる。
 function Build-Dependencies {
     $cmake = Resolve-CMake
     Write-Host "cmake: $cmake"
@@ -275,7 +296,8 @@ function Build-Dependencies {
         -DSNAPPY_BUILD_TESTS=OFF `
         -DSNAPPY_BUILD_BENCHMARKS=OFF `
         -DBUILD_SHARED_LIBS=OFF `
-        -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL
+        -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded `
+        -DCMAKE_POLICY_DEFAULT_CMP0091=NEW
     if ($LASTEXITCODE -ne 0) { throw "snappy cmake configure failed" }
     & $cmake --build $snappyBuild --config Release --target install
     if ($LASTEXITCODE -ne 0) { throw "snappy build/install failed" }
@@ -290,7 +312,8 @@ function Build-Dependencies {
     & $cmake -S $zlibSrc -B $zlibBuild -G "Visual Studio 17 2022" -A x64 `
         "-DCMAKE_INSTALL_PREFIX=$zlibStage" `
         -DZLIB_BUILD_EXAMPLES=OFF `
-        -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL
+        -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded `
+        -DCMAKE_POLICY_DEFAULT_CMP0091=NEW
     if ($LASTEXITCODE -ne 0) { throw "zlib cmake configure failed" }
     & $cmake --build $zlibBuild --config Release --target install
     if ($LASTEXITCODE -ne 0) { throw "zlib build/install failed" }
@@ -847,19 +870,42 @@ function Test-CodecCoverage {
         throw "d3d11va hwaccel missing (kinocore's zero-copy path needs it)"
     }
 
-    # 静的リンクの確認。zlib.dll / snappy.dll に依存していたら、その DLL も配らねば
-    # ならず、消費者の同梱物が静かに壊れる。
+    # DLL が自己完結していることの確認。ここは黙って skip させない — CRT の取り違えは
+    # 警告だけ出して通ってしまう種類の事故なので、検査が効かないなら失敗させる。
+    #
+    #   zlib.dll / snappy.dll   → 外部ライブラリが動的リンクになっている。その DLL も
+    #                             配る必要があり、消費者の同梱物が静かに壊れる
+    #   MSVCP140 / VCRUNTIME140 → snappy か zlib を /MD で作ってしまっている。VC++
+    #                             再頒布パッケージが無いマシンでアプリが起動しない
     $dumpbin = Get-Command dumpbin.exe -ErrorAction SilentlyContinue
-    if ($dumpbin) {
-        $avcodec = Get-ChildItem (Join-Path $FFmpegDir "bin") -Filter "avcodec-*.dll" | Select-Object -First 1
-        $deps = & $dumpbin.Source /dependents $avcodec.FullName 2>&1 | Out-String
-        foreach ($bad in @('zlib', 'snappy')) {
-            if ($deps -match "(?i)$bad[0-9]*\.dll") {
-                throw "$($avcodec.Name) depends on a $bad DLL; the dependency must be linked statically"
-            }
+    $dumpbinPath = if ($dumpbin) { $dumpbin.Source } else {
+        Get-ChildItem (Join-Path $vsRoot "VC/Tools/MSVC/*/bin/Hostx64/x64/dumpbin.exe") -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+    }
+    if (-not $dumpbinPath) { throw "dumpbin.exe not found; cannot verify the DLL is self-contained" }
+
+    $avcodec = Get-ChildItem (Join-Path $FFmpegDir "bin") -Filter "avcodec-*.dll" | Select-Object -First 1
+    $deps = & $dumpbinPath /dependents $avcodec.FullName 2>&1 | Out-String
+    foreach ($bad in @('zlib', 'snappy')) {
+        if ($deps -match "(?i)\b$bad[0-9_]*\.dll") {
+            throw "$($avcodec.Name) depends on a $bad DLL; the dependency must be linked statically"
         }
-    } else {
-        Write-Host "  (dumpbin not on PATH; skipped the static-linkage check)"
+    }
+    if ($deps -match '(?i)\b(MSVCP|VCRUNTIME|CONCRT)[0-9_]*\.dll') {
+        throw "$($avcodec.Name) depends on the dynamic MSVC runtime. Build snappy/zlib with CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded (/MT) to match FFmpeg, which cl.exe compiles with the static CRT by default."
+    }
+
+    # CRT 混在のカナリア。/MD と /MT が混ざると link は警告だけ出して成功するので、
+    # ログを見ないと気付けない (2026-09-08 に実測で踏んだ)。
+    if (Test-Path $MakeLog) {
+        $mk = Get-Content $MakeLog -Raw
+        if ($mk -match 'LNK4098') {
+            throw "make log contains LNK4098 (defaultlib conflict): the CRT of snappy/zlib does not match FFmpeg's. See $MakeLog"
+        }
+        if ($mk -match 'LNK4217') {
+            $hit = ([regex]'.*LNK4217.*').Match($mk).Value
+            throw "make log contains LNK4217 (CRT symbol imported across runtimes): $hit`nSee $MakeLog"
+        }
     }
 
     # MinGW の成果物が混入していないこと。--pkg-config=false で塞いでいるが、
